@@ -23,7 +23,7 @@ export async function body(req:NextRequest) {
 export function ok(data:unknown,status=200) { return NextResponse.json(data,{status,headers:{'Cache-Control':'no-store'}}); }
 export function failed(error:unknown) {
   const id=crypto.randomUUID();
-  if (error instanceof ApiError) return ok({code:error.code,message:error.code,fields:error.fields,requestId:id,retryable:error.status>=500},error.status);
+  if (error instanceof ApiError) return ok({code:error.code,message:({RULE_SOURCES_EMPTY:'Отметьте приемы на доске или добавьте пожелание, чтобы предложить правила.',SELECT_RULES_FIRST:'Отметьте хотя бы одно правило для сборки инструкции. Ручной текст можно сохранить и экспортировать отдельно.',NEW_METHOD_CYCLE_REQUIRED:'Для нового метода начните отдельный цикл: текущие документы и история сохранятся.'} as Record<string,string>)[error.code]||error.code,fields:error.fields,requestId:id,retryable:error.status>=500},error.status);
   if (error instanceof ContextExceededError) return ok({code:error.code,message:`Для этого цикла сохранен предел ${error.limit.toLocaleString('ru-RU')} токенов; приблизительно требуется ${error.estimated.toLocaleString('ru-RU')}. Текст сохранен. Проверьте модель текущего цикла или создайте новый с подходящим лимитом.`,fields:{estimatedTokens:error.estimated,modelContextTokens:error.limit},requestId:id,retryable:false},422);
   if (error instanceof ProviderError) return ok({code:error.code,message:error.code,requestId:id,retryable:error.retryable},503);
   if (error instanceof ZodError) return ok({code:'INVALID_INPUT',message:'Проверьте поля',fields:error.flatten(),requestId:id,retryable:false},422);

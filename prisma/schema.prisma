@@ -64,6 +64,8 @@ model Cycle {
   modelId String
   modelContext Int?
   reasoningEffort String @default("auto")
+  methodVersion Int @default(1)
+  rulesRevision Int @default(0)
   instructionId String
   instructions Json
   locked Boolean @default(false)
@@ -87,6 +89,8 @@ model Cycle {
   samples Sample[]
   usages Usage[]
   checks Check[]
+  ruleBatches RuleBatch[]
+  rules VoiceRule[]
 }
 
 model Reference {
@@ -95,6 +99,7 @@ model Reference {
   cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
   title String
   position Int @default(0)
+  sourceRole String @default("unspecified")
   author String @default("")
   note String @default("")
   focus String @default("")
@@ -123,6 +128,7 @@ model Analysis {
   textRevisionId String
   depth String
   summary String @db.Text
+  portrait Json?
   elements Json
   createdAt DateTime @default(now())
   selections Selection[]
@@ -232,4 +238,50 @@ model Idempotency {
 model WorkerHeartbeat {
   id String @id
   seenAt DateTime @default(now())
+}
+
+model RuleBatch {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  inputHash String
+  sourceSnapshot Json
+  candidates Json
+  notes Json
+  createdAt DateTime @default(now())
+  rules VoiceRule[]
+}
+
+model VoiceRule {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  batchId String?
+  candidateId String?
+  batch RuleBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  direction String
+  text String @db.Text
+  category String @default("")
+  condition String @default("")
+  severity String @default("none")
+  selected Boolean @default(false)
+  sourceIds Json @default("[]")
+  origin String @default("reference")
+  editedByUser Boolean @default(false)
+  archived Boolean @default(false)
+  revision Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  revisions RuleRevision[]
+  @@index([cycleId])
+}
+
+model RuleRevision {
+  id String @id @default(uuid())
+  ruleId String
+  rule VoiceRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  number Int
+  snapshot Json
+  createdAt DateTime @default(now())
+  @@unique([ruleId, number])
 }

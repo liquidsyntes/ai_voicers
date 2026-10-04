@@ -31,4 +31,23 @@ describe('OpenRouter streaming analysis',()=>{
   it('rejects an incomplete stream instead of publishing a partial analysis',async()=>{
     await expect(readOpenRouterStream(streamed([first]),AbortSignal.timeout(5000))).rejects.toMatchObject({code:'STREAM_INTERRUPTED'});
   });
+  it('uses the rules protocol and validates the final streamed candidates',async()=>{
+    const answer={candidates:[{id:'r1',direction:'do',text:'Меняй длину фраз.',category:'Ритм',condition:'При смене темпа',sourceIds:['s1']}],notes:[]};
+    let sent:any;
+    vi.stubGlobal('fetch',vi.fn(async (_url:string,options:{body:string})=>{sent=JSON.parse(options.body);return streamed([`data: ${JSON.stringify({choices:[{delta:{content:JSON.stringify(answer)}}]})}\n\n`,usage,'data: [DONE]\n\n'])}));
+    const result=await complete('rules','test/model','Создай кандидаты.',{methodVersion:2,sources:[{id:'s1',principle:'Меняй ритм'}]},'test-key',AbortSignal.timeout(5000));
+    expect(result.value).toEqual(answer);
+    expect(sent.response_format.json_schema.name).toBe('voice_rules');
+    expect(sent.response_format.json_schema.schema.required).toContain('candidates');
+    expect(result.usage.totalTokens).toBe(150);
+  });
+  it('requires the voice portrait in the model-2 analysis response',async()=>{
+    const answer={summary:'Наблюдение',portrait:{voice:'Разговорный голос',purposeHypothesis:'Вероятно, объяснить',audienceHypothesis:'Неизвестна',tone:'Спокойный',limits:[]},elements:[]};
+    let sent:any;
+    vi.stubGlobal('fetch',vi.fn(async (_url:string,options:{body:string})=>{sent=JSON.parse(options.body);return streamed([`data: ${JSON.stringify({choices:[{delta:{content:JSON.stringify(answer)}}]})}\n\n`,'data: [DONE]\n\n'])}));
+    const result=await complete('analyze','test/model','Анализируй текст.',{methodVersion:2,text:'Синтетический текст',depth:'detailed'},'test-key',AbortSignal.timeout(5000));
+    expect(result.value).toEqual(answer);
+    expect(sent.response_format.json_schema.schema.required).toContain('portrait');
+    expect(sent.response_format.json_schema.schema.properties.elements.items.required).toContain('transferability');
+  });
 });

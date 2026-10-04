@@ -1,3 +1,5 @@
+import {publishRules} from './lib/rules-service';
+import type {RuleInput} from './lib/method';
 import { db } from './lib/db';
 import { queue } from './lib/queue';
 import { complete, ProviderError, type Kind, type ReasoningEffort } from './lib/provider';
@@ -32,7 +34,7 @@ async function processJob(id:string, signal:AbortSignal) {
       if(latest?.state==='cancel_requested'||latest?.state==='canceled') {await db.aiJob.updateMany({where:{id,state:{in:['running','cancel_requested']}},data:{state:'canceled',stage:'canceled'}});return;}
       try {
         await stage('connecting',attempt);
-        const timeoutMs=kind==='analyze'?(input.depth==='brief'?180000:input.depth==='deep'?840000:720000):180000;
+        const timeoutMs=(kind==='rules'?360000:kind==='analyze'?(input.depth==='brief'?180000:input.depth==='deep'?840000:720000):180000);
         const timeout=AbortSignal.timeout(timeoutMs);
         const cancelController=new AbortController();
         const poll=setInterval(async()=>{try{const j=await db.aiJob.findUnique({where:{id},select:{state:true}});if(!j||j.state==='cancel_requested'||j.state==='canceled')cancelController.abort()}catch{}},1000);
@@ -52,7 +54,7 @@ async function processJob(id:string, signal:AbortSignal) {
         await stage('saving',attempt,result.value&&kind==='analyze'?JSON.stringify(result.value).length:undefined);
         await db.$transaction(async tx=>{
           const locked=await tx.$queryRaw<{state:string}[]>`SELECT state FROM "AiJob" WHERE id = ${id} FOR UPDATE`;
-          if(locked[0]?.state!=='running')return;
+          if(locked[0]?.state!=='running'){if(locked[0]?.state==='cancel_requested')await tx.aiJob.update({where:{id},data:{state:'canceled',stage:'canceled'}});return;}
           const still=await tx.cycle.findUnique({where:{id:cycle.id},include:{project:true}});
           if(!still||still.archived||still.project.archived){await tx.aiJob.update({where:{id},data:{state:'canceled',stage:'canceled'}});return;}
           if(kind==='analyze') {
@@ -60,7 +62,9 @@ async function processJob(id:string, signal:AbortSignal) {
             const ref=await tx.reference.findUnique({where:{id:String(input.referenceId)}});
             if(!ref||ref.cycleId!==cycle.id){await tx.aiJob.update({where:{id},data:{state:'canceled',stage:'canceled'}});return;}
             const validated=validateEvidence(String(input.text),parsed);
-            await tx.analysis.create({data:{referenceId:ref.id,textRevisionId:String(input.textRevisionId),depth:String(input.depth),summary:parsed.summary,elements:json(validated.elements)}});
+            await tx.analysis.create({data:{referenceId:ref.id,textRevisionId:String(input.textRevisionId),depth:String(input.depth),summary:parsed.summary,portrait:parsed.portrait?json(parsed.portrait):undefined,elements:json(validated.elements)}});
+          } else if(kind==='rules'){
+            await publishRules(tx,cycle.id,{sources:input.sources} as RuleInput,result.value);
           } else if(kind==='assemble'||kind==='prompt') {
             const parsed=kind==='assemble'?assemblySchema.parse(result.value):promptSchema.parse(result.value);
             const notes=kind==='assemble'?assemblySchema.parse(result.value).notes:promptSchema.parse(result.value).retainedRules;

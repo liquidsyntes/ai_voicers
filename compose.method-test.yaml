@@ -1,0 +1,37 @@
+# Isolated acceptance environment: database and secrets live only in tmpfs.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: voicers_test
+      POSTGRES_USER: voicers_test
+      POSTGRES_PASSWORD: local_test_only
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U voicers_test -d voicers_test']
+      interval: 2s
+      retries: 20
+  migrate:
+    image: ai_voicers-web:latest
+    environment: &testenv
+      DATABASE_URL: postgresql://voicers_test:local_test_only@db:5432/voicers_test
+      AI_ADAPTER: test
+      AI_TEST_DELAY_MS: 1000
+      MASTER_KEY_PATH: /data/keys/master.key
+    depends_on:
+      db: {condition: service_healthy}
+    command: [npm, run, 'db:migrate']
+  web:
+    image: ai_voicers-web:latest
+    environment: *testenv
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    ports: ['127.0.0.1:3334:3000']
+    tmpfs: [/data/keys]
+  worker:
+    image: ai_voicers-web:latest
+    environment: *testenv
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    command: [npm, run, worker]
+    tmpfs: [/data/keys]

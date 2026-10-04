@@ -1,8 +1,10 @@
+import {sourceRoleSchema,ruleDraftSchema,selectedRulePayload,ruleWarnings} from '@/lib/method';
+import {ruleInput,ruleInputHash,ruleSnapshot,restoreRules} from '@/lib/rules-service';
 import { NextRequest } from 'next/server';
 import { Prisma } from '@/generated/prisma/client';
 import { db, owner } from '@/lib/db';
 import { ApiError, body, failed, guard, ok } from '@/lib/http';
-import { defaults, hash, instructionsSchema, analysisSchema } from '@/lib/domain';
+import { defaults, hash, instructionsSchema, analysisSchema, methodInstructions } from '@/lib/domain';
 import { encrypt, decrypt } from '@/lib/secret';
 import { catalog, contextCheck } from '@/lib/provider';
 import { queue } from '@/lib/queue';
@@ -56,6 +58,7 @@ async function get(req:NextRequest,p:string[],ownerId:string) {
     const project=await db.project.findFirst({where:{id:p[1],ownerId},include:{cycles:{orderBy:{createdAt:'desc'}}}});
     if(!project) throw new ApiError(404,'NOT_FOUND'); return {project};
   }
+  if(p[0]==='rules'&&p[2]==='revisions'){const rule=await db.voiceRule.findFirst({where:{id:p[1],cycle:{project:{ownerId}}}});if(!rule)throw new ApiError(404,'NOT_FOUND');return {revisions:await db.ruleRevision.findMany({where:{ruleId:rule.id},orderBy:{number:'desc'}})};}
   if(p[0]==='cycles'&&p[1]) {
     const cycle=await requireCycle(p[1],ownerId);
     if(p[2]==='usage') {
@@ -70,8 +73,10 @@ async function get(req:NextRequest,p:string[],ownerId:string) {
       db.check.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}}),
       db.aiJob.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'},take:25,select:{id:true,kind:true,state:true,stage:true,errorCode:true,createdAt:true,updatedAt:true,startedAt:true,lastProgressAt:true,progressChars:true,attemptCount:true,input:true}})
     ]);
+    const [rules,ruleBatches]=await Promise.all([db.voiceRule.findMany({where:{cycleId:cycle.id},orderBy:[{createdAt:'desc'},{id:'asc'}]}),db.ruleBatch.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}})]);
+    const currentRuleInputHash=cycle.methodVersion>=2?ruleInputHash(await ruleInput(db,cycle.id)):null;
     const safeJobs=jobs.map(({input,...job})=>{const source=input&&typeof input==='object'&&!Array.isArray(input)?input as Record<string,unknown>:{};return {...job,referenceId:typeof source.referenceId==='string'?source.referenceId:null,depth:typeof source.depth==='string'?source.depth:null}});
-    return {cycle,promptStale:!!cycle.promptText&&cycle.promptSourceHash!==hash(cycle.fullText),references:references.map(r=>({...r,texts:r.texts.filter(t=>t.id===r.currentTextRevisionId),analyses:r.analyses.sort((a,b)=>Number(b.textRevisionId===r.currentTextRevisionId)-Number(a.textRevisionId===r.currentTextRevisionId)||+new Date(b.createdAt)-+new Date(a.createdAt))})),proposals,versions,samples,checks:checks.map(x=>({...x,current:x.textHash===hash(x.document==='full'?cycle.fullText:cycle.promptText)})),jobs:safeJobs,adapter:process.env.AI_ADAPTER==='test'?'test':'openrouter'};
+    return {cycle,rules,ruleBatches:ruleBatches.map(batch=>({...batch,stale:batch.inputHash!==currentRuleInputHash})),ruleWarnings:ruleWarnings(rules),promptStale:!!cycle.promptText&&cycle.promptSourceHash!==hash(cycle.fullText),references:references.map(r=>({...r,texts:r.texts.filter(t=>t.id===r.currentTextRevisionId),analyses:r.analyses.sort((a,b)=>Number(b.textRevisionId===r.currentTextRevisionId)-Number(a.textRevisionId===r.currentTextRevisionId)||+new Date(b.createdAt)-+new Date(a.createdAt))})),proposals,versions,samples,checks:checks.map(x=>({...x,current:x.textHash===hash(x.document==='full'?cycle.fullText:cycle.promptText)})),jobs:safeJobs,adapter:process.env.AI_ADAPTER==='test'?'test':'openrouter'};
   }
   if(p[0]==='jobs'&&p[1]) {
     const job=await db.aiJob.findFirst({where:{id:p[1],cycle:{project:{ownerId}}},select:{id:true,kind:true,state:true,stage:true,errorCode:true,result:true,createdAt:true,updatedAt:true,startedAt:true,lastProgressAt:true,progressChars:true,attemptCount:true,input:true}});
@@ -117,7 +122,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const modelId=z.string().min(1).max(250).parse(b.modelId||settings.defaultModel);
     const modelContext=b.modelContext===undefined?(modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
     const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
-    const project=await db.project.create({data:{ownerId,name:z.string().min(1).max(120).parse(b.name),cycles:{create:{modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:inst?.content||json(defaults)}}},include:{cycles:true}});
+    const project=await db.project.create({data:{ownerId,name:z.string().min(1).max(120).parse(b.name),cycles:{create:{methodVersion:2,modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:json(methodInstructions(inst?.content||defaults))}}},include:{cycles:true}});
     for(let n=1;n<=5;n++) {
       const ref=await db.reference.create({data:{cycleId:project.cycles[0].id,title:`Отрывок ${n}`,position:n,texts:{create:{body:'',hash:hash('')}}},include:{texts:true}});
       await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});
@@ -133,7 +138,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const modelId=z.string().min(1).max(250).parse(b.modelId||source.modelId);
     const modelContext=b.modelContext===undefined?(modelId===source.modelId?source.modelContext:modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
     const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:modelId===source.modelId?source.reasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
-    const cycle=await db.cycle.create({data:{projectId:project.id,modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:inst?.content||json(defaults),references:{create:refs.map(r=>{const current=r.texts.find(t=>t.id===r.currentTextRevisionId);return {title:r.title,position:r.position,author:r.author,note:r.note,focus:r.focus,texts:{create:{body:current?.body||'',hash:current?.hash||hash('')}}}})}}});
+    const cycle=await db.cycle.create({data:{methodVersion:2,projectId:project.id,modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:json(methodInstructions(inst?.content||defaults)),references:{create:refs.map(r=>{const current=r.texts.find(t=>t.id===r.currentTextRevisionId);return {title:r.title,position:r.position,sourceRole:r.sourceRole,author:r.author,note:r.note,focus:r.focus,texts:{create:{body:current?.body||'',hash:current?.hash||hash('')}}}})}}});
     const copied=await db.reference.findMany({where:{cycleId:cycle.id},include:{texts:true}});
     for(const ref of copied) await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});
     return {cycle};
@@ -142,7 +147,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const cycle=await requireCycle(p[1],ownerId); writable(cycle);
     const title=z.string().min(1).max(120).parse(b.title||'Отрывок'); const content=text.parse(b.text||'');
     const last=await db.reference.aggregate({where:{cycleId:cycle.id},_max:{position:true}});
-    const ref=await db.reference.create({data:{cycleId:cycle.id,title,position:(last._max.position||0)+1,author:z.string().max(150).parse(b.author||''),note:z.string().max(2000).parse(b.note||''),focus:z.string().max(500).parse(b.focus||''),texts:{create:{body:content,hash:hash(content)}}},include:{texts:true}});
+    const ref=await db.reference.create({data:{cycleId:cycle.id,title,sourceRole:sourceRoleSchema.parse(b.sourceRole||'unspecified'),position:(last._max.position||0)+1,author:z.string().max(150).parse(b.author||''),note:z.string().max(2000).parse(b.note||''),focus:z.string().max(500).parse(b.focus||''),texts:{create:{body:content,hash:hash(content)}}},include:{texts:true}});
     await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}}); return {reference:ref};
   }
   if(p[0]==='references'&&p[2]==='duplicate') {
@@ -150,7 +155,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const current=await db.referenceText.findUnique({where:{id:source.currentTextRevisionId||''}});
     const value=current?.body||'';
     const last=await db.reference.aggregate({where:{cycleId:source.cycleId},_max:{position:true}});
-    const ref=await db.reference.create({data:{cycleId:source.cycleId,title:source.title+' — копия',position:(last._max.position||0)+1,author:source.author,note:source.note,focus:source.focus,texts:{create:{body:value,hash:hash(value)}}},include:{texts:true}});
+    const ref=await db.reference.create({data:{cycleId:source.cycleId,title:source.title+' — копия',sourceRole:source.sourceRole,position:(last._max.position||0)+1,author:source.author,note:source.note,focus:source.focus,texts:{create:{body:value,hash:hash(value)}}},include:{texts:true}});
     await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});return {reference:ref};
   }
   if(p[0]==='references'&&p[2]==='analyses') {
@@ -162,14 +167,41 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     contextCheck({text:current.body},cycle.modelContext);
     return idem(req,ownerId,{refId:ref.id,textRevisionId:current.id,depth},async()=>{
       if(!cycle.locked) await db.cycle.updateMany({where:{id:cycle.id,locked:false},data:{locked:true}});
-      return enqueue(cycle.id,'analyze',{referenceId:ref.id,textRevisionId:current.id,text:current.body,depth});
+      return enqueue(cycle.id,'analyze',{referenceId:ref.id,textRevisionId:current.id,text:current.body,depth,...(cycle.methodVersion>=2?{methodVersion:2}:{})});
     });
+  }
+  if(p[0]==='cycles'&&p[2]==='rules') {
+    const cycle=await requireCycle(p[1],ownerId);writable(cycle);
+    if(cycle.methodVersion<2)throw new ApiError(409,'NEW_METHOD_CYCLE_REQUIRED');
+    return idem(req,ownerId,b,async()=>{
+      const latest=await requireCycle(cycle.id,ownerId);rev(latest.revision,b.expectedRevision);
+      const input=await ruleInput(db,cycle.id);
+      if(!input.sources.length)throw new ApiError(422,'RULE_SOURCES_EMPTY');
+      contextCheck(input,cycle.modelContext);
+      if(!cycle.locked)await db.cycle.updateMany({where:{id:cycle.id,locked:false},data:{locked:true}});
+      return enqueue(cycle.id,'rules',{...input,methodVersion:2});
+    });
+  }
+  if(p[0]==='cycles'&&p[2]==='manual-rules') {
+    const cycle=await requireCycle(p[1],ownerId);writable(cycle);
+    if(cycle.methodVersion<2)throw new ApiError(409,'NEW_METHOD_CYCLE_REQUIRED');
+    const rule=ruleDraftSchema.parse(b.rule);
+    return idem(req,ownerId,b,()=>db.$transaction(async tx=>{
+      const created=await tx.voiceRule.create({data:{cycleId:cycle.id,...rule,origin:'user',editedByUser:true}});
+      await tx.ruleRevision.create({data:{ruleId:created.id,number:1,snapshot:ruleSnapshot(created)}});
+      await tx.cycle.update({where:{id:cycle.id},data:{rulesRevision:{increment:1},revision:{increment:1}}});
+      return {rule:created};
+    }));
   }
   if(p[0]==='cycles'&&p[1]&&['assemblies','prompt-versions','checks','samples'].includes(p[2]||'')) {
     const cycle=await requireCycle(p[1],ownerId); writable(cycle);
     const kind=p[2]==='assemblies'?'assemble':p[2]==='prompt-versions'?'prompt':p[2]==='checks'?'check':'sample';
     let input:unknown;
-    if(kind==='assemble') {
+    if(kind==='assemble'&&cycle.methodVersion>=2){
+      const rules=await db.voiceRule.findMany({where:{cycleId:cycle.id},orderBy:[{createdAt:'asc'},{id:'asc'}]});
+      const payload=selectedRulePayload(rules);if(!payload.rules.length)throw new ApiError(422,'SELECT_RULES_FIRST');
+      input={...payload,methodVersion:2};
+    }else if(kind==='assemble') {
       const currentReferences=await db.reference.findMany({where:{cycleId:cycle.id},select:{currentTextRevisionId:true,analyses:{select:{id:true,textRevisionId:true},orderBy:[{createdAt:'desc'},{id:'desc'}]}}});
       const latestIds=currentReferences.map(reference=>reference.analyses.find(analysis=>analysis.textRevisionId===reference.currentTextRevisionId)?.id).filter((id):id is string=>!!id);
       const selections=await db.selection.findMany({where:{state:'selected',analysisId:{in:latestIds}},include:{analysis:{include:{reference:true}}}});
@@ -183,43 +215,67 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     else {const document=z.enum(['full','prompt']).parse(b.document||'full');const value=document==='full'?cycle.fullText:cycle.promptText;if(!value) throw new ApiError(422,'DOCUMENT_EMPTY');input={document,text:value,textHash:hash(value),situation:z.string().min(1).max(2000).parse(b.situation),words:z.number().int().min(50).max(500).parse(b.words||200)};}
     if(kind==='assemble') input={...(input as object),baseRevision:cycle.fullRevision};
     contextCheck(input,cycle.modelContext);
-    return idem(req,ownerId,{kind,input},()=>enqueue(cycle.id,kind,input));
+    return idem(req,ownerId,{kind,input},async()=>{if(cycle.methodVersion>=2&&!cycle.locked)await db.cycle.updateMany({where:{id:cycle.id,locked:false},data:{locked:true}});return enqueue(cycle.id,kind,input)});
   }
   if(p[0]==='cycles'&&p[2]==='versions') {
     const cycle=await requireCycle(p[1],ownerId);
-    return idem(req,ownerId,{name:b.name,revision:b.expectedRevision},async()=>{
-      rev(cycle.revision,b.expectedRevision);
-      const selections=await db.selection.findMany({where:{analysis:{reference:{cycleId:cycle.id}}}});
-      const usages=await db.usage.findMany({where:{cycleId:cycle.id}});
-      const references=await db.reference.findMany({where:{cycleId:cycle.id},include:{texts:true,analyses:{include:{selections:true}}}});
-      const snapshot={modelId:cycle.modelId,reasoningEffort:cycle.reasoningEffort,instructionId:cycle.instructionId,fullText:cycle.fullText,promptText:cycle.promptText,promptSourceHash:cycle.promptSourceHash,wishes:cycle.wishes,constraints:cycle.constraints,selections,references,fullRevision:cycle.fullRevision,promptRevision:cycle.promptRevision,usage:{total:usages.some(u=>u.totalTokens===null)?null:usages.reduce((a,u)=>a+(u.totalTokens||0),0)}};
-      const version=await db.voiceVersion.create({data:{cycleId:cycle.id,name:z.string().min(1).max(100).parse(b.name),snapshot:json(snapshot)}});
+    return idem(req,ownerId,{name:b.name,revision:b.expectedRevision},()=>db.$transaction(async tx=>{
+      const current=await tx.cycle.findUniqueOrThrow({where:{id:cycle.id}});rev(current.revision,b.expectedRevision);
+      const selections=await tx.selection.findMany({where:{analysis:{reference:{cycleId:cycle.id}}}});
+      const usages=await tx.usage.findMany({where:{cycleId:cycle.id}});
+      const references=await tx.reference.findMany({where:{cycleId:cycle.id},include:{texts:true,analyses:{include:{selections:true}}}});
+      const rules=await tx.voiceRule.findMany({where:{cycleId:cycle.id}});
+      const ruleBatches=await tx.ruleBatch.findMany({where:{cycleId:cycle.id}});
+      const snapshot={methodVersion:current.methodVersion,rules,ruleBatches,rulesRevision:current.rulesRevision,modelId:current.modelId,reasoningEffort:current.reasoningEffort,instructionId:current.instructionId,fullText:current.fullText,promptText:current.promptText,promptSourceHash:current.promptSourceHash,wishes:current.wishes,constraints:current.constraints,selections,references,fullRevision:current.fullRevision,promptRevision:current.promptRevision,usage:{total:usages.some(u=>u.totalTokens===null)?null:usages.reduce((a,u)=>a+(u.totalTokens||0),0)}};
+      const version=await tx.voiceVersion.create({data:{cycleId:cycle.id,name:z.string().min(1).max(100).parse(b.name),snapshot:json(JSON.parse(JSON.stringify(snapshot)))}});
       return {version};
-    });
+    },{isolationLevel:Prisma.TransactionIsolationLevel.RepeatableRead}));
   }
   if(p[0]==='versions'&&p[2]==='continue') {
     const version=await db.voiceVersion.findFirst({where:{id:p[1],cycle:{project:{ownerId}}},include:{cycle:true}});if(!version) throw new ApiError(404,'NOT_FOUND');
     const snap=version.snapshot as Record<string,unknown>;
-    const cycle=await db.cycle.create({data:{projectId:version.cycle.projectId,modelId:version.cycle.modelId,modelContext:version.cycle.modelContext,reasoningEffort:version.cycle.reasoningEffort,instructionId:version.cycle.instructionId,instructions:json(version.cycle.instructions),locked:true,fullText:String(snap.fullText||''),promptText:String(snap.promptText||''),promptSourceHash:snap.promptSourceHash?String(snap.promptSourceHash):null,wishes:String(snap.wishes||''),constraints:json(snap.constraints||[]),fullRevision:1,promptRevision:1}});
+    const cycle=await db.$transaction(async tx=>{
+    const createdCycle=await tx.cycle.create({data:{projectId:version.cycle.projectId,methodVersion:version.cycle.methodVersion,modelId:version.cycle.modelId,modelContext:version.cycle.modelContext,reasoningEffort:version.cycle.reasoningEffort,instructionId:version.cycle.instructionId,instructions:json(version.cycle.instructions),locked:true,fullText:String(snap.fullText||''),promptText:String(snap.promptText||''),promptSourceHash:snap.promptSourceHash?String(snap.promptSourceHash):null,wishes:String(snap.wishes||''),constraints:json(snap.constraints||[]),fullRevision:1,promptRevision:1}});
+    const selectionIds=new Map<string,string>();
     const refs=Array.isArray(snap.references)?snap.references as Record<string,unknown>[]:[];
     for(const raw of refs) {
       const texts=Array.isArray(raw.texts)?raw.texts as Record<string,unknown>[]:[];
       const current=texts.find(t=>t.id===raw.currentTextRevisionId)||texts[0];
       const value=String(current?.body||'');
-      const ref=await db.reference.create({data:{cycleId:cycle.id,title:String(raw.title||'Отрывок'),position:Number(raw.position||0),author:String(raw.author||''),note:String(raw.note||''),focus:String(raw.focus||''),archived:Boolean(raw.archived),texts:{create:{body:value,hash:hash(value)}}},include:{texts:true}});
-      await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});
+      const ref=await tx.reference.create({data:{cycleId:createdCycle.id,title:String(raw.title||'Отрывок'),position:Number(raw.position||0),sourceRole:sourceRoleSchema.parse(raw.sourceRole||'unspecified'),author:String(raw.author||''),note:String(raw.note||''),focus:String(raw.focus||''),archived:Boolean(raw.archived),texts:{create:{body:value,hash:hash(value)}}},include:{texts:true}});
+      await tx.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});
       const analyses=Array.isArray(raw.analyses)?raw.analyses as Record<string,unknown>[]:[];
       for(const original of analyses.filter(a=>a.textRevisionId===raw.currentTextRevisionId)) {
         const oldSelections=Array.isArray(original.selections)?original.selections as Record<string,unknown>[]:[];
-        await db.analysis.create({data:{referenceId:ref.id,textRevisionId:ref.texts[0].id,depth:String(original.depth),summary:String(original.summary),elements:json(original.elements),selections:{create:oldSelections.map(s=>({elementId:String(s.elementId),state:String(s.state),role:String(s.role),strength:Number(s.strength),frequency:String(s.frequency),condition:String(s.condition)}))}}});
+        await tx.analysis.create({data:{referenceId:ref.id,textRevisionId:ref.texts[0].id,depth:String(original.depth),summary:String(original.summary),portrait:original.portrait?json(original.portrait):undefined,elements:json(original.elements),selections:{create:oldSelections.map(s=>{const id=crypto.randomUUID();selectionIds.set(String(s.id),id);return {id,elementId:String(s.elementId),state:String(s.state),role:String(s.role),strength:Number(s.strength),frequency:String(s.frequency),condition:String(s.condition)}})}}});
       }
     }
+    await restoreRules(tx,createdCycle.id,snap,selectionIds);
+    return tx.cycle.findUniqueOrThrow({where:{id:createdCycle.id}});
+    },{timeout:15000});
     return {cycle};
   }
   throw new ApiError(404,'NOT_FOUND');
 }
 async function patch(req:NextRequest,p:string[],ownerId:string) {
   const b=await body(req);
+  if(p[0]==='rules'&&p[1]) {
+    const existing=await db.voiceRule.findFirst({where:{id:p[1],cycle:{project:{ownerId}}},include:{cycle:{include:{project:true}}}});
+    if(!existing)throw new ApiError(404,'NOT_FOUND');writable(existing.cycle);
+    const change=z.object({expectedRevision:z.number().int().positive(),text:z.string().optional(),direction:z.enum(['do','dont']).optional(),severity:z.enum(['none','soft','ban']).optional(),category:z.string().optional(),condition:z.string().optional(),selected:z.boolean().optional(),archived:z.boolean().optional()}).strict().parse(b);
+    const {expectedRevision,archived,...fields}=change;
+    return idem(req,ownerId,b,()=>db.$transaction(async tx=>{
+      const current=await tx.voiceRule.findUniqueOrThrow({where:{id:existing.id}});rev(current.revision,expectedRevision);
+      const value=ruleDraftSchema.parse({text:current.text,direction:current.direction,severity:current.severity,category:current.category,condition:current.condition,selected:current.selected,...fields});
+      const edited=current.editedByUser||['text','direction','category','condition','severity'].some(k=>k in fields&&fields[k as keyof typeof fields]!==current[k as keyof typeof current]);
+      const changed=await tx.voiceRule.updateMany({where:{id:current.id,revision:expectedRevision},data:{...value,archived:archived??current.archived,editedByUser:edited,revision:{increment:1}}});
+      if(!changed.count)throw new ApiError(409,'REVISION_CONFLICT');
+      const rule=await tx.voiceRule.findUniqueOrThrow({where:{id:current.id}});
+      await tx.ruleRevision.create({data:{ruleId:rule.id,number:rule.revision,snapshot:ruleSnapshot(rule)}});
+      await tx.cycle.update({where:{id:rule.cycleId},data:{rulesRevision:{increment:1},revision:{increment:1}}});
+      return {rule};
+    }));
+  }
   if(p[0]==='settings') {
     const current=await db.settings.findUniqueOrThrow({where:{ownerId}}); rev(current.revision,b.expectedRevision);
     const settings=await db.settings.update({where:{ownerId},data:{theme:b.theme===undefined?undefined:z.enum(['light','dark']).parse(b.theme),defaultModel:b.defaultModel===undefined?undefined:z.string().max(250).parse(b.defaultModel),defaultModelContext:b.defaultModelContext===undefined?undefined:b.defaultModelContext===null?null:z.number().int().positive().parse(b.defaultModelContext),defaultReasoningEffort:b.defaultReasoningEffort===undefined?undefined:reasoning.parse(b.defaultReasoningEffort),instructionId:b.instructionId===undefined?undefined:b.instructionId===null?null:z.string().parse(b.instructionId),revision:{increment:1}}}); return {settings};
@@ -237,11 +293,12 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
     const reasoningEffort=b.reasoningEffort===undefined?(modelId===cycle.modelId?cycle.reasoningEffort:modelId===settings.defaultModel?settings.defaultReasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
     const selected=instructionId==='standard'?null:await db.instructionRevision.findFirst({where:{id:instructionId,ownerId}});
     if(instructionId!=='standard'&&!selected)throw new ApiError(404,'INSTRUCTIONS_NOT_FOUND');
-    const updated=await db.cycle.update({where:{id:cycle.id},data:{modelId,modelContext,reasoningEffort,instructionId,instructions:selected?.content||json(defaults),revision:{increment:1}}});
+    const updated=await db.cycle.update({where:{id:cycle.id},data:{modelId,modelContext,reasoningEffort,instructionId,instructions:cycle.methodVersion>=2?json(methodInstructions(selected?.content||defaults)):selected?.content||json(defaults),revision:{increment:1}}});
     return {cycle:updated,currentInstructionId:settings.instructionId};
   }
   if(p[0]==='references'&&p[1]) {
     const ref=await requireRef(p[1],ownerId);writable(ref.cycle);rev(ref.revision,b.expectedRevision);
+    const sourceRole=b.sourceRole===undefined?undefined:sourceRoleSchema.parse(b.sourceRole);
     const title=b.title===undefined?undefined:z.string().min(1).max(120).parse(b.title);
     const author=b.author===undefined?undefined:z.string().max(150).parse(b.author);
     const note=b.note===undefined?undefined:z.string().max(2000).parse(b.note);
@@ -252,7 +309,7 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
       const value=text.parse(b.text), current=await db.referenceText.findUnique({where:{id:ref.currentTextRevisionId||''}});
       if(current?.body!==value) currentTextRevisionId=(await db.referenceText.create({data:{referenceId:ref.id,body:value,hash:hash(value)}})).id;
     }
-    const updated=await db.reference.update({where:{id:ref.id},data:{title,author,note,focus,archived,currentTextRevisionId,revision:{increment:1}}});return {reference:updated};
+    const changed=await db.reference.updateMany({where:{id:ref.id,revision:b.expectedRevision},data:{title,sourceRole,author,note,focus,archived,currentTextRevisionId,revision:{increment:1}}});if(!changed.count)throw new ApiError(409,'REVISION_CONFLICT');await db.cycle.update({where:{id:ref.cycleId},data:{revision:{increment:1}}});return {reference:await db.reference.findUniqueOrThrow({where:{id:ref.id}})};
   }
   if(p[0]==='cycles'&&p[2]==='selection') {
     const cycle=await requireCycle(p[1],ownerId);writable(cycle);
@@ -266,6 +323,7 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
     const old=await db.selection.findUnique({where:{analysisId_elementId:{analysisId:analysis.id,elementId:e.id}}});
     if(old) rev(old.revision,b.expectedRevision);
     const selection=state==='unreviewed' ? (old?await db.selection.delete({where:{id:old.id}}):null) : await db.selection.upsert({where:{analysisId_elementId:{analysisId:analysis.id,elementId:e.id}},create:{analysisId:analysis.id,elementId:e.id,state},update:{state,role:b.role===undefined?undefined:z.enum(['primary','secondary']).parse(b.role),strength:b.strength===undefined?undefined:z.number().int().min(1).max(5).parse(b.strength),frequency:b.frequency===undefined?undefined:z.enum(['rare','moderate','regular','conditional']).parse(b.frequency),condition:b.condition===undefined?undefined:z.string().max(500).parse(b.condition),revision:{increment:1}}});
+    await db.cycle.update({where:{id:cycle.id},data:{revision:{increment:1}}});
     return {selection};
   }
   if(p[0]==='cycles'&&p[2]==='selection-settings') {
@@ -321,7 +379,7 @@ async function handle(req:NextRequest,ctx:Ctx) {
   try {guard(req);const p=(await ctx.params).path||[];const current=await owner();
     const result=req.method==='GET'?await get(req,p,current.id):req.method==='POST'?await post(req,p,current.id):req.method==='PATCH'?await patch(req,p,current.id):req.method==='DELETE'?await del(req,p,current.id):null;
     if(result===null)throw new ApiError(405,'METHOD_NOT_ALLOWED');
-    return result instanceof Response?result:ok(result,req.method==='POST'&&(['analyses','assemblies','prompt-versions','checks','samples'].includes(p[2]||''))?202:200);
+    return result instanceof Response?result:ok(result,req.method==='POST'&&(['analyses','rules','assemblies','prompt-versions','checks','samples'].includes(p[2]||''))?202:200);
   } catch(e) {return failed(e);}
 }
 export const GET=handle; export const POST=handle; export const PATCH=handle; export const DELETE=handle;
