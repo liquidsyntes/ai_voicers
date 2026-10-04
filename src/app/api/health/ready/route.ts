@@ -1,0 +1,2 @@
+import { db } from '@/lib/db';
+export async function GET(){try{await db.$queryRaw`SELECT 1`;const worker=await db.workerHeartbeat.findUnique({where:{id:'worker'}});if(!worker||Date.now()-worker.seenAt.getTime()>90000)return Response.json({status:'worker-unavailable'},{status:503});return Response.json({status:'ready',database:true,worker:true});}catch{return Response.json({status:'unavailable'},{status:503});}}

@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';
+const origin='http://localhost:3000';
+async function request(path,method='GET',data,headers={}){
+  const r=await fetch(origin+'/api/v1/'+path,{method,headers:{...(data!==undefined?{'Content-Type':'application/json'}:{}),...(method!=='GET'?{Origin:origin}:{}),...headers},body:data===undefined?undefined:JSON.stringify(data)});
+  return {status:r.status,value:await r.json()};
+}
+const bad=await request('projects','POST',{name:'Недопустимый запрос',modelId:'x'},{Origin:'https://outside.example'});
+assert.equal(bad.status,403);
+const existing=(await request('projects')).value.projects.find(p=>p.name==='Проверка длинного текста');
+const p=existing?{status:200,value:{project:existing}}:await request('projects','POST',{name:'Проверка длинного текста',modelId:'test/context',modelContext:2000});
+assert.equal(p.status,200);
+const cycleId=p.value.project.cycles[0].id;
+let data=(await request('cycles/'+cycleId)).value;
+const ref=data.references[0],long='слово '.repeat(5500).trim();
+const saved=await request('references/'+ref.id,'PATCH',{expectedRevision:ref.revision,text:long});
+assert.equal(saved.status,200);
+data=(await request('cycles/'+cycleId)).value;
+assert.ok(data.references[0].texts[0].body===long,'saved long text differs');
+const conflict=await request('references/'+ref.id,'PATCH',{expectedRevision:ref.revision,text:'перезапись'});
+assert.equal(conflict.status,409);
+const over=await request('references/'+ref.id+'/analyses','POST',{depth:'deep'},{'Idempotency-Key':crypto.randomUUID()});
+assert.equal(over.status,422);
+assert.equal(over.value.code,'CONTEXT_EXCEEDED');
+data=(await request('cycles/'+cycleId)).value;
+assert.ok(data.references[0].texts[0].body===long,'context failure changed text');
+const newCycle=await request('projects/'+p.value.project.id+'/cycles','POST',{sourceCycleId:cycleId,modelId:'another/model'});
+assert.equal(newCycle.status,200);
+const next=(await request('cycles/'+newCycle.value.cycle.id)).value;
+assert.ok(next.references[0].texts[0].body===long,'new cycle did not copy current text');
+assert.equal(next.references[0].analyses.length,0);
+const version=await request('cycles/'+cycleId+'/versions','POST',{name:'Длинный текст',expectedRevision:data.cycle.revision},{'Idempotency-Key':crypto.randomUUID()});
+assert.equal(version.status,200);
+const continued=await request('versions/'+version.value.version.id+'/continue','POST',{});
+assert.equal(continued.status,200);
+const fromVersion=(await request('cycles/'+continued.value.cycle.id)).value;
+assert.ok(fromVersion.references[0].texts[0].body===long,'version continuation did not copy text');
+console.log(JSON.stringify({status:'passed',checks:['foreign-origin','5500-words','revision-conflict','context-preserved','new-cycle','version-continuation'] }));

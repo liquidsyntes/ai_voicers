@@ -1,0 +1,228 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Owner {
+  id        String   @id @default(uuid())
+  name      String   @default("Локальный владелец")
+  createdAt DateTime @default(now())
+  settings  Settings?
+  credential Credential?
+  instructions InstructionRevision[]
+  projects Project[]
+}
+
+model Settings {
+  ownerId String @id
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  theme String @default("light")
+  defaultModel String @default("")
+  defaultModelContext Int?
+  instructionId String?
+  revision Int @default(1)
+}
+
+model Credential {
+  ownerId String @id
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  cipherText String
+  mask String
+  updatedAt DateTime @updatedAt
+}
+
+model InstructionRevision {
+  id String @id @default(uuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name String
+  content Json
+  createdAt DateTime @default(now())
+}
+
+model Project {
+  id String @id @default(uuid())
+  ownerId String
+  owner Owner @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name String
+  archived Boolean @default(false)
+  revision Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  cycles Cycle[]
+}
+
+model Cycle {
+  id String @id @default(uuid())
+  projectId String
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  modelId String
+  modelContext Int?
+  instructionId String
+  instructions Json
+  locked Boolean @default(false)
+  archived Boolean @default(false)
+  revision Int @default(1)
+  wishes String @default("")
+  constraints Json @default("[]")
+  fullText String @default("") @db.Text
+  promptText String @default("") @db.Text
+  fullRevision Int @default(0)
+  promptRevision Int @default(0)
+  promptSourceHash String?
+  fullManual Boolean @default(false)
+  promptManual Boolean @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  references Reference[]
+  proposals Proposal[]
+  versions VoiceVersion[]
+  jobs AiJob[]
+  samples Sample[]
+  usages Usage[]
+  checks Check[]
+}
+
+model Reference {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  title String
+  position Int @default(0)
+  author String @default("")
+  note String @default("")
+  focus String @default("")
+  archived Boolean @default(false)
+  revision Int @default(1)
+  currentTextRevisionId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  texts ReferenceText[]
+  analyses Analysis[]
+}
+
+model ReferenceText {
+  id String @id @default(uuid())
+  referenceId String
+  reference Reference @relation(fields: [referenceId], references: [id], onDelete: Cascade)
+  body String @db.Text
+  hash String
+  createdAt DateTime @default(now())
+}
+
+model Analysis {
+  id String @id @default(uuid())
+  referenceId String
+  reference Reference @relation(fields: [referenceId], references: [id], onDelete: Cascade)
+  textRevisionId String
+  depth String
+  summary String @db.Text
+  elements Json
+  createdAt DateTime @default(now())
+  selections Selection[]
+}
+
+model Selection {
+  id String @id @default(uuid())
+  analysisId String
+  analysis Analysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  elementId String
+  state String @default("selected")
+  role String @default("secondary")
+  strength Int @default(3)
+  frequency String @default("moderate")
+  condition String @default("")
+  revision Int @default(1)
+  @@unique([analysisId, elementId])
+}
+
+model Proposal {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  kind String
+  text String @db.Text
+  baseRevision Int
+  sourceHash String?
+  notes Json @default("[]")
+  applied Boolean @default(false)
+  createdAt DateTime @default(now())
+}
+
+model Check {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  document String
+  textHash String
+  findings Json
+  createdAt DateTime @default(now())
+}
+
+model VoiceVersion {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  name String
+  snapshot Json
+  createdAt DateTime @default(now())
+}
+
+model Sample {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  document String
+  documentHash String
+  situation String
+  result String @default("") @db.Text
+  comment String @default("")
+  createdAt DateTime @default(now())
+}
+
+model AiJob {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  kind String
+  state String @default("queued")
+  input Json
+  result Json?
+  errorCode String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  attempts Usage[]
+  @@index([state])
+}
+
+model Usage {
+  id String @id @default(uuid())
+  cycleId String
+  cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  jobId String
+  job AiJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  attempt Int
+  inputTokens Int?
+  outputTokens Int?
+  totalTokens Int?
+  providerRequestId String?
+  createdAt DateTime @default(now())
+  @@unique([jobId, attempt])
+}
+
+model Idempotency {
+  key String @id
+  ownerId String
+  requestHash String
+  response Json
+  createdAt DateTime @default(now())
+}
+
+model WorkerHeartbeat {
+  id String @id
+  seenAt DateTime @default(now())
+}

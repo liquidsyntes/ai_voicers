@@ -1,0 +1,74 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: voicers
+      POSTGRES_USER: voicers
+      POSTGRES_PASSWORD: local_internal_password
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voicers -d voicers"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  backup:
+    image: postgres:17
+    environment:
+      PGHOST: db
+      PGUSER: voicers
+      PGPASSWORD: local_internal_password
+      PGDATABASE: voicers
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh","/scripts/backup.sh"]
+    volumes:
+      - backups:/data/backups
+      - ./scripts/backup.sh:/scripts/backup.sh:ro
+      - ./scripts/verify-backup.sh:/scripts/verify-backup.sh:ro
+    restart: "no"
+  migrate:
+    build: .
+    environment: &environment
+      DATABASE_URL: postgresql://voicers:local_internal_password@db:5432/voicers
+      MASTER_KEY_PATH: /data/keys/master.key
+      AI_ADAPTER: ${AI_ADAPTER:-openrouter}
+    volumes:
+      - keys:/data/keys
+    depends_on:
+      backup:
+        condition: service_completed_successfully
+    command: ["sh","scripts/migrate.sh"]
+    restart: "no"
+  web:
+    build: .
+    environment: *environment
+    volumes:
+      - keys:/data/keys
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-3333}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+  worker:
+    build: .
+    environment: *environment
+    volumes:
+      - keys:/data/keys
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["npm","run","worker"]
+    restart: unless-stopped
+volumes:
+  database:
+  keys:
+  backups:

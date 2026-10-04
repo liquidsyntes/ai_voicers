@@ -1,0 +1,5 @@
+CREATE TABLE "WorkerHeartbeat" (
+  "id" TEXT NOT NULL,
+  "seenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "WorkerHeartbeat_pkey" PRIMARY KEY ("id")
+);

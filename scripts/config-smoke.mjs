@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+const base='http://localhost:3000/api/v1/';
+const modelsResponse=await fetch(base+'providers/models');
+assert.equal(modelsResponse.status,200);
+const models=(await modelsResponse.json()).models;
+assert.ok(models.some(m=>m.id==='z-ai/glm-5.3-flash'));
+const checkResponse=await fetch(base+'providers/check',{method:'POST',headers:{Origin:'http://localhost:3000','Content-Type':'application/json'},body:'{}'});
+assert.equal(checkResponse.status,200);
+assert.equal((await checkResponse.json()).connected,true);
+console.log(JSON.stringify({status:'passed',catalogModels:models.length,manualModelAvailable:true,credentialValid:true,generationCalls:0}));

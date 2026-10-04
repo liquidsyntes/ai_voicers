@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+const root='http://localhost:3000/api/v1/';
+async function req(path,method='GET',body,key){const r=await fetch(root+path,{method,headers:{...(method!=='GET'?{Origin:'http://localhost:3000','Content-Type':'application/json'}:{}),...(key?{'Idempotency-Key':key}:{})},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,data:await r.json()}}
+const project=(await req('projects')).data.projects.find(p=>p.name==='Тестовый проект');assert.ok(project);
+const id=project.cycles[0].id;
+let d=(await req('cycles/'+id)).data;
+assert.equal(d.cycle.locked,true);
+const locked=await req('cycles/'+id+'/config','PATCH',{expectedRevision:d.cycle.revision,modelId:'other/model'});assert.equal(locked.status,409);
+const oldFull=d.cycle.fullText;
+const promptEdit=await req('cycles/'+id+'/draft','PATCH',{kind:'prompt',text:d.cycle.promptText+'\nРучная редакция промпта.',expectedRevision:d.cycle.promptRevision});assert.equal(promptEdit.status,200);
+d=(await req('cycles/'+id)).data;assert.equal(d.cycle.fullText,oldFull);
+const fullEdit=await req('cycles/'+id+'/draft','PATCH',{kind:'full',text:oldFull+'\nПоздняя редакция полной инструкции.',expectedRevision:d.cycle.fullRevision});assert.equal(fullEdit.status,200);
+d=(await req('cycles/'+id)).data;assert.equal(d.promptStale,true);assert.equal(d.checks[0].current,false);
+const key=crypto.randomUUID(),body={name:'Непроверенный снимок',expectedRevision:d.cycle.revision};
+const version=await req('cycles/'+id+'/versions','POST',body,key);assert.equal(version.status,200);
+const repeated=await req('cycles/'+id+'/versions','POST',body,key);assert.equal(repeated.data.version.id,version.data.version.id);
+const conflict=await req('cycles/'+id+'/versions','POST',{...body,name:'Другой заголовок'},key);assert.equal(conflict.status,409);
+const text=await fetch(root+`exports?cycleId=${id}&kind=prompt&format=txt`);assert.equal(await text.text(),d.cycle.promptText);
+const ref=d.references.find(r=>r.analyses.length&&r.analyses[0].selections.length);assert.ok(ref);
+const archived=await req('references/'+ref.id,'PATCH',{expectedRevision:ref.revision,archived:true});assert.equal(archived.status,200);
+d=(await req('cycles/'+id)).data;const archivedRef=d.references.find(r=>r.id===ref.id);assert.equal(archivedRef.archived,true);assert.ok(archivedRef.analyses[0].selections.length);
+const restored=await req('references/'+ref.id,'PATCH',{expectedRevision:archived.data.reference.revision,archived:false});assert.equal(restored.status,200);
+console.log(JSON.stringify({status:'passed',checks:['locked-cycle','prompt-manual','full-stale','check-stale','unchecked-version','idempotency','txt-export','archive-provenance']}));
