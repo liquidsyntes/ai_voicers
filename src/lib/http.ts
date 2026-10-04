@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ZodError } from 'zod';
-import { ProviderError } from './provider';
+import { ProviderError, ContextExceededError } from './provider';
 
 export class ApiError extends Error { constructor(public status:number, public code:string, public fields?:unknown) { super(code); } }
 export function guard(req:NextRequest) {
@@ -24,7 +24,8 @@ export function ok(data:unknown,status=200) { return NextResponse.json(data,{sta
 export function failed(error:unknown) {
   const id=crypto.randomUUID();
   if (error instanceof ApiError) return ok({code:error.code,message:error.code,fields:error.fields,requestId:id,retryable:error.status>=500},error.status);
-  if (error instanceof ProviderError) return ok({code:error.code,message:error.code==='CONTEXT_EXCEEDED'?'Контекст выбранной модели недостаточен; текст сохранен. Уменьшите вход или начните новый цикл с другой моделью.':error.code,requestId:id,retryable:error.retryable},error.code==='CONTEXT_EXCEEDED'?422:503);
+  if (error instanceof ContextExceededError) return ok({code:error.code,message:`Для этого цикла сохранен предел ${error.limit.toLocaleString('ru-RU')} токенов; приблизительно требуется ${error.estimated.toLocaleString('ru-RU')}. Текст сохранен. Проверьте модель текущего цикла или создайте новый с подходящим лимитом.`,fields:{estimatedTokens:error.estimated,modelContextTokens:error.limit},requestId:id,retryable:false},422);
+  if (error instanceof ProviderError) return ok({code:error.code,message:error.code,requestId:id,retryable:error.retryable},503);
   if (error instanceof ZodError) return ok({code:'INVALID_INPUT',message:'Проверьте поля',fields:error.flatten(),requestId:id,retryable:false},422);
   if (error instanceof Error && error.message.startsWith('MASTER_KEY_')) return ok({code:error.message,message:'Ключ шифрования недоступен. Восстановите том ключа или заново настройте API-ключ.',requestId:id,retryable:false},503);
   console.error('request failed',id,error instanceof Error?error.name:'unknown');

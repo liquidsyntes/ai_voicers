@@ -1,0 +1,20 @@
+import {db} from '../src/lib/db';
+import {analysisSchema,validateEvidence} from '../src/lib/domain';
+import {Prisma} from '../src/generated/prisma/client';
+const id=process.argv[2];if(!id)throw new Error('Analysis ID required');
+const original=await db.analysis.findUnique({where:{id},include:{reference:true,selections:true}});
+if(!original)throw new Error('Analysis missing');
+const text=await db.referenceText.findUnique({where:{id:original.textRevisionId}});
+if(!text||original.reference.currentTextRevisionId!==text.id)throw new Error('Text revision is no longer current');
+const parsed=analysisSchema.parse({summary:original.summary,elements:original.elements});
+const corrected=validateEvidence(text.body,parsed);
+const before=parsed.elements.flatMap(e=>e.evidence).filter(e=>e.verified).length;
+const after=corrected.elements.flatMap(e=>e.evidence).filter(e=>e.verified).length;
+const total=corrected.elements.flatMap(e=>e.evidence).length;
+const result=await db.$transaction(async tx=>{
+  const latest=await tx.analysis.findFirst({where:{referenceId:original.referenceId,textRevisionId:original.textRevisionId},orderBy:[{createdAt:'desc'},{id:'desc'}],select:{id:true}});
+  if(latest?.id!==original.id)throw new Error('A newer analysis already exists');
+  return tx.analysis.create({data:{referenceId:original.referenceId,textRevisionId:original.textRevisionId,depth:original.depth,summary:original.summary,elements:corrected.elements as Prisma.InputJsonValue,selections:{create:original.selections.map(s=>({elementId:s.elementId,state:s.state,role:s.role,strength:s.strength,frequency:s.frequency,condition:s.condition}))}}});
+});
+console.log(JSON.stringify({oldAnalysisId:original.id,newAnalysisId:result.id,quotesBefore:before,quotesVerified:after,quotesTotal:total,selectionsCopied:original.selections.length}));
+await db.$disconnect();

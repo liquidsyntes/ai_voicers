@@ -25,6 +25,7 @@ data=(await request('cycles/'+cycleId)).value;
 assert.ok(data.references[0].texts[0].body===long,'context failure changed text');
 const newCycle=await request('projects/'+p.value.project.id+'/cycles','POST',{sourceCycleId:cycleId,modelId:'another/model'});
 assert.equal(newCycle.status,200);
+assert.equal(newCycle.value.cycle.modelContext,null);
 const next=(await request('cycles/'+newCycle.value.cycle.id)).value;
 assert.ok(next.references[0].texts[0].body===long,'new cycle did not copy current text');
 assert.equal(next.references[0].analyses.length,0);

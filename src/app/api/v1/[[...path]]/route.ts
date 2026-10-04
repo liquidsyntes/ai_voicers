@@ -11,6 +11,7 @@ import { z } from 'zod';
 export const runtime = 'nodejs';
 type Ctx = {params:Promise<{path?:string[]}>};
 const uuid = z.uuid();
+const reasoning = z.enum(['auto','low','high','max']);
 const text = z.string().max(200000);
 const json = (x:unknown) => x as Prisma.InputJsonValue;
 const rev = (actual:number, expected:unknown) => { if (actual !== expected) throw new ApiError(409,'REVISION_CONFLICT'); };
@@ -50,7 +51,7 @@ async function get(req:NextRequest,p:string[],ownerId:string) {
     return {settings,credential:credential?{configured:true,mask:credential.mask}: {configured:false},instructions,defaults,adapter:process.env.AI_ADAPTER==='test'?'test':'openrouter'};
   }
   if(p[0]==='providers'&&p[1]==='models') return {models:await catalog()};
-  if(p[0]==='projects'&&p.length===1) return {projects:await db.project.findMany({where:{ownerId},include:{cycles:{select:{id:true,modelId:true,locked:true,createdAt:true}}},orderBy:{updatedAt:'desc'}})};
+  if(p[0]==='projects'&&p.length===1) return {projects:await db.project.findMany({where:{ownerId},include:{cycles:{select:{id:true,modelId:true,locked:true,createdAt:true},orderBy:{createdAt:'desc'}}},orderBy:{updatedAt:'desc'}})};
   if(p[0]==='projects'&&p[1]) {
     const project=await db.project.findFirst({where:{id:p[1],ownerId},include:{cycles:{orderBy:{createdAt:'desc'}}}});
     if(!project) throw new ApiError(404,'NOT_FOUND'); return {project};
@@ -67,13 +68,17 @@ async function get(req:NextRequest,p:string[],ownerId:string) {
       db.voiceVersion.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}}),
       db.sample.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}}),
       db.check.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}}),
-      db.aiJob.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'},take:25,select:{id:true,kind:true,state:true,errorCode:true,createdAt:true}})
+      db.aiJob.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'},take:25,select:{id:true,kind:true,state:true,stage:true,errorCode:true,createdAt:true,updatedAt:true,startedAt:true,lastProgressAt:true,progressChars:true,attemptCount:true,input:true}})
     ]);
-    return {cycle,promptStale:!!cycle.promptText&&cycle.promptSourceHash!==hash(cycle.fullText),references:references.map(r=>({...r,texts:r.texts.filter(t=>t.id===r.currentTextRevisionId),analyses:r.analyses.sort((a,b)=>Number(b.textRevisionId===r.currentTextRevisionId)-Number(a.textRevisionId===r.currentTextRevisionId)||+new Date(b.createdAt)-+new Date(a.createdAt))})),proposals,versions,samples,checks:checks.map(x=>({...x,current:x.textHash===hash(x.document==='full'?cycle.fullText:cycle.promptText)})),jobs,adapter:process.env.AI_ADAPTER==='test'?'test':'openrouter'};
+    const safeJobs=jobs.map(({input,...job})=>{const source=input&&typeof input==='object'&&!Array.isArray(input)?input as Record<string,unknown>:{};return {...job,referenceId:typeof source.referenceId==='string'?source.referenceId:null,depth:typeof source.depth==='string'?source.depth:null}});
+    return {cycle,promptStale:!!cycle.promptText&&cycle.promptSourceHash!==hash(cycle.fullText),references:references.map(r=>({...r,texts:r.texts.filter(t=>t.id===r.currentTextRevisionId),analyses:r.analyses.sort((a,b)=>Number(b.textRevisionId===r.currentTextRevisionId)-Number(a.textRevisionId===r.currentTextRevisionId)||+new Date(b.createdAt)-+new Date(a.createdAt))})),proposals,versions,samples,checks:checks.map(x=>({...x,current:x.textHash===hash(x.document==='full'?cycle.fullText:cycle.promptText)})),jobs:safeJobs,adapter:process.env.AI_ADAPTER==='test'?'test':'openrouter'};
   }
   if(p[0]==='jobs'&&p[1]) {
-    const job=await db.aiJob.findFirst({where:{id:p[1],cycle:{project:{ownerId}}},select:{id:true,kind:true,state:true,errorCode:true,result:true}});
-    if(!job) throw new ApiError(404,'NOT_FOUND'); return {job};
+    const job=await db.aiJob.findFirst({where:{id:p[1],cycle:{project:{ownerId}}},select:{id:true,kind:true,state:true,stage:true,errorCode:true,result:true,createdAt:true,updatedAt:true,startedAt:true,lastProgressAt:true,progressChars:true,attemptCount:true,input:true}});
+    if(!job) throw new ApiError(404,'NOT_FOUND');
+    const {input,...safe}=job;
+    const source=input&&typeof input==='object'&&!Array.isArray(input)?input as Record<string,unknown>:{};
+    return {job:{...safe,referenceId:typeof source.referenceId==='string'?source.referenceId:null,depth:typeof source.depth==='string'?source.depth:null}};
   }
   if(p[0]==='exports') {
     const cycle=await requireCycle(uuid.parse(req.nextUrl.searchParams.get('cycleId')),ownerId);
@@ -110,7 +115,9 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const settings=await db.settings.findUniqueOrThrow({where:{ownerId}});
     const inst=settings.instructionId?await db.instructionRevision.findFirst({where:{id:settings.instructionId,ownerId}}):null;
     const modelId=z.string().min(1).max(250).parse(b.modelId||settings.defaultModel);
-    const project=await db.project.create({data:{ownerId,name:z.string().min(1).max(120).parse(b.name),cycles:{create:{modelId,modelContext:b.modelContext??settings.defaultModelContext??null,instructionId:inst?.id||'standard',instructions:inst?.content||json(defaults)}}},include:{cycles:true}});
+    const modelContext=b.modelContext===undefined?(modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
+    const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
+    const project=await db.project.create({data:{ownerId,name:z.string().min(1).max(120).parse(b.name),cycles:{create:{modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:inst?.content||json(defaults)}}},include:{cycles:true}});
     for(let n=1;n<=5;n++) {
       const ref=await db.reference.create({data:{cycleId:project.cycles[0].id,title:`Отрывок ${n}`,position:n,texts:{create:{body:'',hash:hash('')}}},include:{texts:true}});
       await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});
@@ -123,7 +130,10 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const settings=await db.settings.findUniqueOrThrow({where:{ownerId}});
     const inst=settings.instructionId?await db.instructionRevision.findFirst({where:{id:settings.instructionId,ownerId}}):null;
     const refs=await db.reference.findMany({where:{cycleId:source.id,archived:false},include:{texts:true}});
-    const cycle=await db.cycle.create({data:{projectId:project.id,modelId:z.string().min(1).parse(b.modelId||source.modelId),modelContext:b.modelContext??source.modelContext,instructionId:inst?.id||'standard',instructions:inst?.content||json(defaults),references:{create:refs.map(r=>{const current=r.texts.find(t=>t.id===r.currentTextRevisionId);return {title:r.title,position:r.position,author:r.author,note:r.note,focus:r.focus,texts:{create:{body:current?.body||'',hash:current?.hash||hash('')}}}})}}});
+    const modelId=z.string().min(1).max(250).parse(b.modelId||source.modelId);
+    const modelContext=b.modelContext===undefined?(modelId===source.modelId?source.modelContext:modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
+    const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:modelId===source.modelId?source.reasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
+    const cycle=await db.cycle.create({data:{projectId:project.id,modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:inst?.content||json(defaults),references:{create:refs.map(r=>{const current=r.texts.find(t=>t.id===r.currentTextRevisionId);return {title:r.title,position:r.position,author:r.author,note:r.note,focus:r.focus,texts:{create:{body:current?.body||'',hash:current?.hash||hash('')}}}})}}});
     const copied=await db.reference.findMany({where:{cycleId:cycle.id},include:{texts:true}});
     for(const ref of copied) await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});
     return {cycle};
@@ -160,7 +170,9 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const kind=p[2]==='assemblies'?'assemble':p[2]==='prompt-versions'?'prompt':p[2]==='checks'?'check':'sample';
     let input:unknown;
     if(kind==='assemble') {
-      const selections=await db.selection.findMany({where:{state:'selected',analysis:{reference:{cycleId:cycle.id}}},include:{analysis:{include:{reference:true}}}});
+      const currentReferences=await db.reference.findMany({where:{cycleId:cycle.id},select:{currentTextRevisionId:true,analyses:{select:{id:true,textRevisionId:true},orderBy:[{createdAt:'desc'},{id:'desc'}]}}});
+      const latestIds=currentReferences.map(reference=>reference.analyses.find(analysis=>analysis.textRevisionId===reference.currentTextRevisionId)?.id).filter((id):id is string=>!!id);
+      const selections=await db.selection.findMany({where:{state:'selected',analysisId:{in:latestIds}},include:{analysis:{include:{reference:true}}}});
       const selected=selections.filter(s=>s.analysis.textRevisionId===s.analysis.reference.currentTextRevisionId).map(s=>{
         const e=analysisSchema.parse({summary:s.analysis.summary,elements:s.analysis.elements}).elements.find(e=>e.id===s.elementId);
         return e?{id:s.elementId,title:e.title,principle:e.principle,effect:e.effect,categories:e.categories,nuances:e.nuances,role:s.role,strength:s.strength,frequency:s.frequency,condition:s.condition}:null;
@@ -180,7 +192,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
       const selections=await db.selection.findMany({where:{analysis:{reference:{cycleId:cycle.id}}}});
       const usages=await db.usage.findMany({where:{cycleId:cycle.id}});
       const references=await db.reference.findMany({where:{cycleId:cycle.id},include:{texts:true,analyses:{include:{selections:true}}}});
-      const snapshot={modelId:cycle.modelId,instructionId:cycle.instructionId,fullText:cycle.fullText,promptText:cycle.promptText,promptSourceHash:cycle.promptSourceHash,wishes:cycle.wishes,constraints:cycle.constraints,selections,references,fullRevision:cycle.fullRevision,promptRevision:cycle.promptRevision,usage:{total:usages.some(u=>u.totalTokens===null)?null:usages.reduce((a,u)=>a+(u.totalTokens||0),0)}};
+      const snapshot={modelId:cycle.modelId,reasoningEffort:cycle.reasoningEffort,instructionId:cycle.instructionId,fullText:cycle.fullText,promptText:cycle.promptText,promptSourceHash:cycle.promptSourceHash,wishes:cycle.wishes,constraints:cycle.constraints,selections,references,fullRevision:cycle.fullRevision,promptRevision:cycle.promptRevision,usage:{total:usages.some(u=>u.totalTokens===null)?null:usages.reduce((a,u)=>a+(u.totalTokens||0),0)}};
       const version=await db.voiceVersion.create({data:{cycleId:cycle.id,name:z.string().min(1).max(100).parse(b.name),snapshot:json(snapshot)}});
       return {version};
     });
@@ -188,7 +200,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
   if(p[0]==='versions'&&p[2]==='continue') {
     const version=await db.voiceVersion.findFirst({where:{id:p[1],cycle:{project:{ownerId}}},include:{cycle:true}});if(!version) throw new ApiError(404,'NOT_FOUND');
     const snap=version.snapshot as Record<string,unknown>;
-    const cycle=await db.cycle.create({data:{projectId:version.cycle.projectId,modelId:version.cycle.modelId,modelContext:version.cycle.modelContext,instructionId:version.cycle.instructionId,instructions:json(version.cycle.instructions),locked:true,fullText:String(snap.fullText||''),promptText:String(snap.promptText||''),promptSourceHash:snap.promptSourceHash?String(snap.promptSourceHash):null,wishes:String(snap.wishes||''),constraints:json(snap.constraints||[]),fullRevision:1,promptRevision:1}});
+    const cycle=await db.cycle.create({data:{projectId:version.cycle.projectId,modelId:version.cycle.modelId,modelContext:version.cycle.modelContext,reasoningEffort:version.cycle.reasoningEffort,instructionId:version.cycle.instructionId,instructions:json(version.cycle.instructions),locked:true,fullText:String(snap.fullText||''),promptText:String(snap.promptText||''),promptSourceHash:snap.promptSourceHash?String(snap.promptSourceHash):null,wishes:String(snap.wishes||''),constraints:json(snap.constraints||[]),fullRevision:1,promptRevision:1}});
     const refs=Array.isArray(snap.references)?snap.references as Record<string,unknown>[]:[];
     for(const raw of refs) {
       const texts=Array.isArray(raw.texts)?raw.texts as Record<string,unknown>[]:[];
@@ -210,7 +222,7 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
   const b=await body(req);
   if(p[0]==='settings') {
     const current=await db.settings.findUniqueOrThrow({where:{ownerId}}); rev(current.revision,b.expectedRevision);
-    const settings=await db.settings.update({where:{ownerId},data:{theme:b.theme===undefined?undefined:z.enum(['light','dark']).parse(b.theme),defaultModel:b.defaultModel===undefined?undefined:z.string().max(250).parse(b.defaultModel),defaultModelContext:b.defaultModelContext===undefined?undefined:b.defaultModelContext===null?null:z.number().int().positive().parse(b.defaultModelContext),instructionId:b.instructionId===undefined?undefined:b.instructionId===null?null:z.string().parse(b.instructionId),revision:{increment:1}}}); return {settings};
+    const settings=await db.settings.update({where:{ownerId},data:{theme:b.theme===undefined?undefined:z.enum(['light','dark']).parse(b.theme),defaultModel:b.defaultModel===undefined?undefined:z.string().max(250).parse(b.defaultModel),defaultModelContext:b.defaultModelContext===undefined?undefined:b.defaultModelContext===null?null:z.number().int().positive().parse(b.defaultModelContext),defaultReasoningEffort:b.defaultReasoningEffort===undefined?undefined:reasoning.parse(b.defaultReasoningEffort),instructionId:b.instructionId===undefined?undefined:b.instructionId===null?null:z.string().parse(b.instructionId),revision:{increment:1}}}); return {settings};
   }
   if(p[0]==='projects'&&p[1]) {
     const project=await db.project.findFirst({where:{id:p[1],ownerId}});if(!project) throw new ApiError(404,'NOT_FOUND');rev(project.revision,b.expectedRevision);
@@ -220,9 +232,12 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
     const cycle=await requireCycle(p[1],ownerId);writable(cycle);if(cycle.locked)throw new ApiError(409,'CYCLE_LOCKED');rev(cycle.revision,b.expectedRevision);
     const settings=await db.settings.findUniqueOrThrow({where:{ownerId}});
     const instructionId=b.instructionId===undefined?cycle.instructionId:z.string().parse(b.instructionId);
+    const modelId=b.modelId===undefined?cycle.modelId:z.string().min(1).max(250).parse(b.modelId);
+    const modelContext=b.modelContext===undefined?(modelId===cycle.modelId?cycle.modelContext:modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
+    const reasoningEffort=b.reasoningEffort===undefined?(modelId===cycle.modelId?cycle.reasoningEffort:modelId===settings.defaultModel?settings.defaultReasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
     const selected=instructionId==='standard'?null:await db.instructionRevision.findFirst({where:{id:instructionId,ownerId}});
     if(instructionId!=='standard'&&!selected)throw new ApiError(404,'INSTRUCTIONS_NOT_FOUND');
-    const updated=await db.cycle.update({where:{id:cycle.id},data:{modelId:b.modelId===undefined?undefined:z.string().min(1).max(250).parse(b.modelId),modelContext:b.modelContext===undefined?undefined:b.modelContext===null?null:z.number().int().positive().parse(b.modelContext),instructionId,instructions:selected?.content||json(defaults),revision:{increment:1}}});
+    const updated=await db.cycle.update({where:{id:cycle.id},data:{modelId,modelContext,reasoningEffort,instructionId,instructions:selected?.content||json(defaults),revision:{increment:1}}});
     return {cycle:updated,currentInstructionId:settings.instructionId};
   }
   if(p[0]==='references'&&p[1]) {
@@ -243,6 +258,8 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
     const cycle=await requireCycle(p[1],ownerId);writable(cycle);
     const analysis=await db.analysis.findFirst({where:{id:uuid.parse(b.analysisId),reference:{cycleId:cycle.id}},include:{reference:true}});
     if(!analysis||analysis.textRevisionId!==analysis.reference.currentTextRevisionId) throw new ApiError(409,'STALE_ANALYSIS');
+    const latest=await db.analysis.findFirst({where:{referenceId:analysis.referenceId,textRevisionId:analysis.textRevisionId},orderBy:[{createdAt:'desc'},{id:'desc'}],select:{id:true}});
+    if(latest?.id!==analysis.id)throw new ApiError(409,'STALE_ANALYSIS');
     const e=analysisSchema.parse({summary:analysis.summary,elements:analysis.elements}).elements.find(e=>e.id===b.elementId);
     if(!e) throw new ApiError(404,'ELEMENT_NOT_FOUND');
     const state=z.enum(['selected','deferred','excluded','unreviewed']).parse(b.state);

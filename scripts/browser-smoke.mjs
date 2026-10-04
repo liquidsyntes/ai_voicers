@@ -17,7 +17,12 @@ const typography=await page.evaluate(()=>{
 assert.match(typography.hero,/Oswald/);assert.equal(typography.heroWeight,'400');assert.equal(typography.heroStyle,'normal');
 assert.match(typography.section,/Huninn/);assert.equal(typography.loadedOswald,true);assert.equal(typography.loadedHuninn,true);
 await page.screenshot({path:'/tmp/ai_voicers_light.png',fullPage:true});
-await page.getByRole('link',{name:/Тестовый проект/}).click();
+await page.getByRole('link',{name:/Ангел/}).click();
+await page.getByText(/контекст 1.048.576 токенов/).waitFor();
+await page.locator('.analysis-block .element').first().waitFor();
+assert.ok((await page.locator('.analysis-block .element').count())>=1);
+await page.locator('.job-card.succeeded').first().waitFor();
+await page.screenshot({path:'/tmp/ai_voicers_analysis_status.png',fullPage:true});
 await page.getByRole('tab',{name:'Результат'}).click();
 const documentFont=await page.locator('.doc-text').first().evaluate(node=>getComputedStyle(node).fontFamily);
 assert.match(documentFont,/Huninn/);

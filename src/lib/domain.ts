@@ -31,7 +31,12 @@ export const checkSchema = z.object({ findings: z.array(z.object({ kind: z.enum(
 export const sampleSchema = z.object({ text: z.string().min(1) }).strict();
 
 export function validateEvidence(text: string, analysis: z.infer<typeof analysisSchema>) {
-  return { ...analysis, elements: analysis.elements.map(e => ({ ...e, evidence: e.evidence.map(v => ({ ...v, verified: text.slice(v.start, v.end) === v.quote })) })) };
+  return { ...analysis, elements: analysis.elements.map(e => ({ ...e, evidence: e.evidence.map(v => {
+    if(text.slice(v.start,v.end)===v.quote&&v.quote)return {...v,verified:true};
+    const first=v.quote?text.indexOf(v.quote):-1;
+    if(first>=0&&text.indexOf(v.quote,first+1)===-1)return {...v,start:first,end:first+v.quote.length,verified:true};
+    return {...v,verified:false};
+  }) })) };
 }
 
 export function cleanSelected(elements: {title:string; principle:string; categories:string[]; effect:string; nuances:string[]}[], settings: {role:string; strength:number; frequency:string; condition:string}) {

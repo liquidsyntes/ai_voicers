@@ -23,6 +23,7 @@ model Settings {
   theme String @default("light")
   defaultModel String @default("")
   defaultModelContext Int?
+  defaultReasoningEffort String @default("auto")
   instructionId String?
   revision Int @default(1)
 }
@@ -62,6 +63,7 @@ model Cycle {
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   modelId String
   modelContext Int?
+  reasoningEffort String @default("auto")
   instructionId String
   instructions Json
   locked Boolean @default(false)
@@ -190,6 +192,11 @@ model AiJob {
   cycle Cycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
   kind String
   state String @default("queued")
+  stage String @default("queued")
+  startedAt DateTime?
+  progressChars Int @default(0)
+  attemptCount Int @default(0)
+  lastProgressAt DateTime?
   input Json
   result Json?
   errorCode String?
