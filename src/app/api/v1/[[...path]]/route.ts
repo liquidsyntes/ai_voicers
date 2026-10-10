@@ -6,14 +6,15 @@ import { db, owner } from '@/lib/db';
 import { ApiError, body, failed, guard, ok } from '@/lib/http';
 import { defaults, hash, instructionsSchema, analysisSchema, methodInstructions } from '@/lib/domain';
 import { encrypt, decrypt } from '@/lib/secret';
-import { catalog, contextCheck } from '@/lib/provider';
+import { catalog, contextCheck, inspectModel } from '@/lib/provider';
 import { queue } from '@/lib/queue';
+import { suggestedReasoningEffort } from '@/lib/reasoning';
 import { z } from 'zod';
 
 export const runtime = 'nodejs';
 type Ctx = {params:Promise<{path?:string[]}>};
 const uuid = z.uuid();
-const reasoning = z.enum(['auto','low','high','max']);
+const reasoning = z.enum(['auto','none','low','high','max']);
 const text = z.string().max(200000);
 const json = (x:unknown) => x as Prisma.InputJsonValue;
 const rev = (actual:number, expected:unknown) => { if (actual !== expected) throw new ApiError(409,'REVISION_CONFLICT'); };
@@ -52,7 +53,17 @@ async function get(req:NextRequest,p:string[],ownerId:string) {
     const instructions=await db.instructionRevision.findMany({where:{ownerId},orderBy:{createdAt:'desc'}});
     return {settings,credential:credential?{configured:true,mask:credential.mask}: {configured:false},instructions,defaults,adapter:process.env.AI_ADAPTER==='test'?'test':'openrouter'};
   }
-  if(p[0]==='providers'&&p[1]==='models') return {models:await catalog()};
+  if(p[0]==='providers'&&p[1]==='models') {
+    const fresh=req.nextUrl.searchParams.get('refresh')==='1';
+    const credential=fresh?await db.credential.findUnique({where:{ownerId}}):null;
+    return {models:await catalog(fresh,credential?decrypt(credential.cipherText):null)};
+  }
+  if(p[0]==='providers'&&p[1]==='model') {
+    const modelId=z.string().min(3).max(250).parse(req.nextUrl.searchParams.get('modelId'));
+    if(!modelId.includes('/'))throw new ApiError(422,'MODEL_ID_INVALID');
+    const credential=await db.credential.findUnique({where:{ownerId}});
+    return {modelId,...await inspectModel(modelId,credential?decrypt(credential.cipherText):null)};
+  }
   if(p[0]==='projects'&&p.length===1) return {projects:await db.project.findMany({where:{ownerId},include:{cycles:{select:{id:true,modelId:true,locked:true,createdAt:true},orderBy:{createdAt:'desc'}}},orderBy:{updatedAt:'desc'}})};
   if(p[0]==='projects'&&p[1]) {
     const project=await db.project.findFirst({where:{id:p[1],ownerId},include:{cycles:{orderBy:{createdAt:'desc'}}}});
@@ -71,7 +82,7 @@ async function get(req:NextRequest,p:string[],ownerId:string) {
       db.voiceVersion.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}}),
       db.sample.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}}),
       db.check.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}}),
-      db.aiJob.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'},take:25,select:{id:true,kind:true,state:true,stage:true,errorCode:true,createdAt:true,updatedAt:true,startedAt:true,lastProgressAt:true,progressChars:true,attemptCount:true,input:true}})
+      db.aiJob.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'},take:25,select:{id:true,kind:true,state:true,stage:true,errorCode:true,result:true,createdAt:true,updatedAt:true,startedAt:true,lastProgressAt:true,progressChars:true,attemptCount:true,input:true}})
     ]);
     const [rules,ruleBatches]=await Promise.all([db.voiceRule.findMany({where:{cycleId:cycle.id},orderBy:[{createdAt:'desc'},{id:'asc'}]}),db.ruleBatch.findMany({where:{cycleId:cycle.id},orderBy:{createdAt:'desc'}})]);
     const currentRuleInputHash=cycle.methodVersion>=2?ruleInputHash(await ruleInput(db,cycle.id)):null;
@@ -121,7 +132,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const inst=settings.instructionId?await db.instructionRevision.findFirst({where:{id:settings.instructionId,ownerId}}):null;
     const modelId=z.string().min(1).max(250).parse(b.modelId||settings.defaultModel);
     const modelContext=b.modelContext===undefined?(modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
-    const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
+    const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:suggestedReasoningEffort(modelId)):reasoning.parse(b.reasoningEffort);
     const project=await db.project.create({data:{ownerId,name:z.string().min(1).max(120).parse(b.name),cycles:{create:{methodVersion:2,modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:json(methodInstructions(inst?.content||defaults))}}},include:{cycles:true}});
     for(let n=1;n<=5;n++) {
       const ref=await db.reference.create({data:{cycleId:project.cycles[0].id,title:`Отрывок ${n}`,position:n,texts:{create:{body:'',hash:hash('')}}},include:{texts:true}});
@@ -137,7 +148,7 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     const refs=await db.reference.findMany({where:{cycleId:source.id,archived:false},include:{texts:true}});
     const modelId=z.string().min(1).max(250).parse(b.modelId||source.modelId);
     const modelContext=b.modelContext===undefined?(modelId===source.modelId?source.modelContext:modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
-    const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:modelId===source.modelId?source.reasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
+    const reasoningEffort=b.reasoningEffort===undefined?(modelId===settings.defaultModel?settings.defaultReasoningEffort:modelId===source.modelId?source.reasoningEffort:suggestedReasoningEffort(modelId)):reasoning.parse(b.reasoningEffort);
     const cycle=await db.cycle.create({data:{methodVersion:2,projectId:project.id,modelId,modelContext,reasoningEffort,instructionId:inst?.id||'standard',instructions:json(methodInstructions(inst?.content||defaults)),references:{create:refs.map(r=>{const current=r.texts.find(t=>t.id===r.currentTextRevisionId);return {title:r.title,position:r.position,sourceRole:r.sourceRole,author:r.author,note:r.note,focus:r.focus,texts:{create:{body:current?.body||'',hash:current?.hash||hash('')}}}})}}});
     const copied=await db.reference.findMany({where:{cycleId:cycle.id},include:{texts:true}});
     for(const ref of copied) await db.reference.update({where:{id:ref.id},data:{currentTextRevisionId:ref.texts[0].id}});
@@ -166,7 +177,13 @@ async function post(req:NextRequest,p:string[],ownerId:string) {
     if(!current?.body.trim()) throw new ApiError(422,'EMPTY_REFERENCE');
     contextCheck({text:current.body},cycle.modelContext);
     return idem(req,ownerId,{refId:ref.id,textRevisionId:current.id,depth},async()=>{
-      if(!cycle.locked) await db.cycle.updateMany({where:{id:cycle.id,locked:false},data:{locked:true}});
+      if(!cycle.locked){
+        if(process.env.AI_ADAPTER!=='test'){
+          const credential=await db.credential.findUnique({where:{ownerId}});
+          if(credential&&(await inspectModel(cycle.modelId,decrypt(credential.cipherText))).status==='unavailable')throw new ApiError(422,'MODEL_UNAVAILABLE');
+        }
+        await db.cycle.updateMany({where:{id:cycle.id,locked:false},data:{locked:true}});
+      }
       return enqueue(cycle.id,'analyze',{referenceId:ref.id,textRevisionId:current.id,text:current.body,depth,...(cycle.methodVersion>=2?{methodVersion:2}:{})});
     });
   }
@@ -290,7 +307,7 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
     const instructionId=b.instructionId===undefined?cycle.instructionId:z.string().parse(b.instructionId);
     const modelId=b.modelId===undefined?cycle.modelId:z.string().min(1).max(250).parse(b.modelId);
     const modelContext=b.modelContext===undefined?(modelId===cycle.modelId?cycle.modelContext:modelId===settings.defaultModel?settings.defaultModelContext:null):b.modelContext===null?null:z.number().int().positive().parse(b.modelContext);
-    const reasoningEffort=b.reasoningEffort===undefined?(modelId===cycle.modelId?cycle.reasoningEffort:modelId===settings.defaultModel?settings.defaultReasoningEffort:'auto'):reasoning.parse(b.reasoningEffort);
+    const reasoningEffort=b.reasoningEffort===undefined?(modelId===cycle.modelId?cycle.reasoningEffort:modelId===settings.defaultModel?settings.defaultReasoningEffort:suggestedReasoningEffort(modelId)):reasoning.parse(b.reasoningEffort);
     const selected=instructionId==='standard'?null:await db.instructionRevision.findFirst({where:{id:instructionId,ownerId}});
     if(instructionId!=='standard'&&!selected)throw new ApiError(404,'INSTRUCTIONS_NOT_FOUND');
     const updated=await db.cycle.update({where:{id:cycle.id},data:{modelId,modelContext,reasoningEffort,instructionId,instructions:cycle.methodVersion>=2?json(methodInstructions(selected?.content||defaults)):selected?.content||json(defaults),revision:{increment:1}}});
@@ -372,7 +389,20 @@ async function patch(req:NextRequest,p:string[],ownerId:string) {
 }
 async function del(req:NextRequest,p:string[],ownerId:string) {
   if(p[0]==='settings'&&p[1]==='credential') {await db.credential.deleteMany({where:{ownerId}});return {deleted:true};}
-  if(p[0]==='projects'&&p[1]) {const project=await db.project.findFirst({where:{id:p[1],ownerId}});if(!project)throw new ApiError(404,'NOT_FOUND');await db.project.delete({where:{id:project.id}});return {deleted:true};}
+  if(p[0]==='projects'&&p[1]) {
+    return db.$transaction(async tx=>{
+      const project=await tx.project.findFirst({where:{id:p[1],ownerId}});
+      if(!project)throw new ApiError(404,'NOT_FOUND');
+      const cycles=await tx.cycle.findMany({where:{projectId:project.id},select:{id:true,jobs:{select:{id:true}}}});
+      const relatedIds=new Set([project.id,...cycles.flatMap(c=>[c.id,...c.jobs.map(j=>j.id)])]);
+      const containsRelatedId=(value:unknown):boolean=>typeof value==='string'?relatedIds.has(value):Array.isArray(value)?value.some(containsRelatedId):value!==null&&typeof value==='object'?Object.values(value).some(containsRelatedId):false;
+      const stored=await tx.idempotency.findMany({where:{ownerId},select:{key:true,response:true}});
+      const relatedKeys=stored.filter(entry=>containsRelatedId(entry.response)).map(entry=>entry.key);
+      if(relatedKeys.length)await tx.idempotency.deleteMany({where:{key:{in:relatedKeys}}});
+      await tx.project.delete({where:{id:project.id}});
+      return {deleted:true};
+    },{timeout:15000});
+  }
   throw new ApiError(404,'NOT_FOUND');
 }
 async function handle(req:NextRequest,ctx:Ctx) {

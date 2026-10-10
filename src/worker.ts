@@ -14,6 +14,9 @@ async function processJob(id:string, signal:AbortSignal) {
   if(!job||job.state!=='queued'||job.cycle.archived||job.cycle.project.archived) return;
   const claimed=await db.aiJob.updateMany({where:{id,state:'queued'},data:{state:'running',stage:'preparing',startedAt:new Date(),progressChars:0,attemptCount:0,lastProgressAt:new Date()}});
   if(!claimed.count)return;
+  const workerStarted=performance.now();
+  const milliseconds=(value:number)=>Math.round(value);
+  const timingAttempts:Record<string,unknown>[]=[];
   const {cycle}=job;
   const input=job.input as Record<string,unknown>;
   const kind=job.kind as Kind;
@@ -40,18 +43,34 @@ async function processJob(id:string, signal:AbortSignal) {
         const poll=setInterval(async()=>{try{const j=await db.aiJob.findUnique({where:{id},select:{state:true}});if(!j||j.state==='cancel_requested'||j.state==='canceled')cancelController.abort()}catch{}},1000);
         let result;
         let lastProgress=0;
+        let headersObservedMs:number|null=null,firstChunkObservedMs:number|null=null;
+        let providerStarted=0;
         const progress=async(event:{stage:'waiting'|'reasoning'|'generating';outputChars:number})=>{
           const now=Date.now();
+          if(event.stage==='waiting'&&headersObservedMs===null)headersObservedMs=milliseconds(performance.now()-providerStarted);
+          if(event.stage!=='waiting'&&firstChunkObservedMs===null)firstChunkObservedMs=milliseconds(performance.now()-providerStarted);
           if(event.outputChars===0&&event.stage==='generating')return;
           if(now-lastProgress<1500&&event.outputChars>0)return;
           lastProgress=now;
           try{await stage(event.stage,attempt,event.outputChars)}catch{}
         };
-        try {result=await complete(kind,cycle.modelId,renderInstruction(kind,instructions[kind],input),input,key,AbortSignal.any([signal,timeout,cancelController.signal]),repairText,progress,cycle.reasoningEffort as ReasoningEffort);}
+        const instruction=renderInstruction(kind,instructions[kind],input);
+        const preparationMs=milliseconds(performance.now()-workerStarted);
+        providerStarted=performance.now();
+        try {result=await complete(kind,cycle.modelId,instruction,input,key,AbortSignal.any([signal,timeout,cancelController.signal]),repairText,progress,cycle.reasoningEffort as ReasoningEffort);}
+        catch(error){
+          const providerError=error instanceof ProviderError?error:null;
+          timingAttempts.push({attempt,preparationMs,providerMs:milliseconds(performance.now()-providerStarted),headersObservedMs,firstChunkObservedMs,errorCode:providerError?.code||'WORKER_ERROR',httpStatus:providerError?.status??null});
+          throw error;
+        }
         finally {clearInterval(poll);}
+        timingAttempts.push({attempt,preparationMs,providerMs:milliseconds(performance.now()-providerStarted),provider:result.timings||null,reasoningTokens:result.reasoningTokens??null,inputTokens:result.usage.inputTokens,outputTokens:result.usage.outputTokens});
+        const postprocessStarted=performance.now();
         await stage('validating',attempt);
         await db.usage.upsert({where:{jobId_attempt:{jobId:id,attempt}},create:{cycleId:cycle.id,jobId:id,attempt,inputTokens:result.usage.inputTokens,outputTokens:result.usage.outputTokens,totalTokens:result.usage.totalTokens,providerRequestId:result.requestId},update:{}});
         await stage('saving',attempt,result.value&&kind==='analyze'?JSON.stringify(result.value).length:undefined);
+        const postprocessMs=milliseconds(performance.now()-postprocessStarted);
+        const savingStarted=performance.now();
         await db.$transaction(async tx=>{
           const locked=await tx.$queryRaw<{state:string}[]>`SELECT state FROM "AiJob" WHERE id = ${id} FOR UPDATE`;
           if(locked[0]?.state!=='running'){if(locked[0]?.state==='cancel_requested')await tx.aiJob.update({where:{id},data:{state:'canceled',stage:'canceled'}});return;}
@@ -76,7 +95,7 @@ async function processJob(id:string, signal:AbortSignal) {
             const parsed=sampleSchema.parse(result.value);
             await tx.sample.create({data:{cycleId:cycle.id,document:String(input.document),documentHash:String(input.textHash),situation:String(input.situation),result:parsed.text}});
           }
-          await tx.aiJob.update({where:{id},data:{state:'succeeded',stage:'completed',result:json({model:result.model||cycle.modelId})}});
+          await tx.aiJob.update({where:{id},data:{state:'succeeded',stage:'completed',result:json({model:result.model||cycle.modelId,diagnostics:{attempts:timingAttempts,postprocessMs,saveTransactionMs:milliseconds(performance.now()-savingStarted)}})}});
         });
         return;
       } catch(error) {
@@ -85,7 +104,7 @@ async function processJob(id:string, signal:AbortSignal) {
         if(e.code==='INVALID_RESPONSE'&&!repairUsed&&e.repairText){repairUsed=true;repairText=e.repairText;await stage('repairing',attempt);continue;}
         if(e.retryable&&transientRetries<2){transientRetries++;await stage('retrying',attempt);await sleep(Math.max(e.retryAfter*1000,1000*2**(transientRetries-1)));continue;}
         if((await db.aiJob.findUnique({where:{id}}))?.state==='cancel_requested') {await db.aiJob.update({where:{id},data:{state:'canceled',stage:'canceled'}});return;}
-        await db.aiJob.updateMany({where:{id,state:{in:['running','cancel_requested']}},data:{state:'failed',stage:'failed',errorCode:e.code}});return;
+        await db.aiJob.updateMany({where:{id,state:{in:['running','cancel_requested']}},data:{state:'failed',stage:'failed',errorCode:e.code,result:json({diagnostics:{attempts:timingAttempts}})}});return;
       }
     }
   } catch(error) {

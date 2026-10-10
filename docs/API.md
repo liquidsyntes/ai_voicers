@@ -30,11 +30,12 @@ Invoke-RestMethod -Uri "$base/api/v1/projects" -Method Post -ContentType 'applic
 | Метод и путь | Тело / результат |
 | --- | --- |
 | `GET /settings` | Настройки, маска ключа, список редакций, стандартные шаблоны и активный адаптер. Полный ключ не возвращается. |
-| `PATCH /settings` | `expectedRevision` и одно или несколько полей: `theme` (`light`/`dark`), `defaultModel`, `defaultModelContext`, `defaultReasoningEffort` (`auto`/`low`/`high`/`max`), `instructionId`. |
+| `PATCH /settings` | `expectedRevision` и одно или несколько полей: `theme` (`light`/`dark`), `defaultModel`, `defaultModelContext`, `defaultReasoningEffort` (`auto`/`none`/`low`/`high`/`max`), `instructionId`. `none` отключает рассуждение через `reasoning.enabled=false`; применимость зависит от модели. |
 | `POST /settings/credential` | `{ "key": "…" }`; шифрует и заменяет ключ, возвращает маску. |
 | `DELETE /settings/credential` | Удаляет сохраненную запись ключа. |
 | `POST /providers/check` | Проверка сохраненного ключа через OpenRouter `/api/v1/key`; генерации нет. |
-| `GET /providers/models` | Каталог текстовых моделей OpenRouter с `id`, `name`, `contextLength`; сервер использует кеш до часа. |
+| `GET /providers/models` | Каталог текстовых моделей OpenRouter с `id`, `name`, `contextLength`; сервер использует кеш до часа. `?refresh=1` обходит кеш и при сохраненном ключе запрашивает каталог с учетом доступа аккаунта. |
+| `GET /providers/model?modelId=…` | Чтение доступности точного model ID через OpenRouter без генерации. Возвращает `available`, `unavailable` или `unknown`, а также признаки поддержки строгого JSON и рассуждения, если метаданные доступны. `unavailable` означает, что модель или совместимый endpoint не найдены на момент проверки. |
 | `POST /instructions` | `{ "name": "…", "content": {…} }`; создает новую редакцию шести рабочих инструкций и выбирает ее для новых циклов. |
 
 `content` содержит строки `analyze`, `rules`, `assemble`, `prompt`, `check`, `sample`. Допустимые переменные: `analyze` — `{{depth}}`, `{{word_count}}`; `rules` и `assemble` — `{{selected_count}}`; `prompt`, `check`, `sample` — `{{document_length}}`. Неизвестная переменная отклоняется. Для старой редакции без `rules` сервер подставляет стандартный шаблон этого шага при создании цикла метода 2. В текущей реализации `{{selected_count}}` в шаблоне `assemble` считает массив `selected` старого метода и выводит `0` для входа метода 2 с массивом `rules`; на это значение в собственной редакции инструкции пока не следует опираться.
@@ -47,7 +48,7 @@ Invoke-RestMethod -Uri "$base/api/v1/projects" -Method Post -ContentType 'applic
 | `POST /projects` | `{ "name": "…", "modelId": "provider/model" }`; создает проект, цикл метода 2 и пять пустых референсов. Необязательные `modelContext` и `reasoningEffort` уточняют модель. |
 | `GET /projects/{id}` | Проект с циклами. |
 | `PATCH /projects/{id}` | `expectedRevision`, `name` и/или `archived`. |
-| `DELETE /projects/{id}` | Необратимо удаляет проект с зависимыми данными. |
+| `DELETE /projects/{id}` | Необратимо удаляет проект с зависимыми данными и служебными ответами повторных запросов, связанными с ним. Глобальные настройки не затрагиваются; существующие дампы БД остаются. |
 | `POST /projects/{id}/cycles` | `sourceCycleId`, необязательные `modelId`, `modelContext`, `reasoningEffort`; создает цикл метода 2 с копиями неархивных текущих текстов и ролей, без анализов. |
 | `GET /cycles/{id}` | Рабочий цикл, текущие тексты, разборы, правила, группы, предложения, версии, проверки, пробы и последние 25 заданий. Полный input задания из этого ответа исключен. |
 | `PATCH /cycles/{id}/config` | `expectedRevision`, модель, контекст, уровень рассуждения и/или редакция инструкций. Доступно до фиксации цикла. |
@@ -57,6 +58,10 @@ Invoke-RestMethod -Uri "$base/api/v1/projects" -Method Post -ContentType 'applic
 | `POST /references/{id}/analyses` | `{ "depth": "brief|detailed|deep" }`; отдельное задание анализа текущей редакции. Требует `Idempotency-Key`. |
 
 `sourceRole`: `own` (мой голос), `inspiration` (ориентир), `unspecified` (без роли). У анализа метода 2 появляются `portrait` и `transferability` каждого элемента: `form`, `topic` либо `mixed`. `GET /cycles/{id}` возвращает историю анализов, но только текущую редакцию текста для каждого референса; источник прошлой редакции не подменяет актуальный разбор.
+
+Перед первой постановкой анализа в очередь сервер бесплатно проверяет точный model ID. Подтвержденный HTTP 404 возвращает 422 `MODEL_UNAVAILABLE` без блокировки цикла и без отправки исходного текста в запрос генерации. Если сервис проверки недоступен, ручной model ID не блокируется; ошибка вызова по-прежнему отражается в задании.
+
+При создании проекта, нового цикла или смене модели до фиксации можно явно передать `reasoningEffort`. Для `~deepseek/deepseek-flash-latest` и `deepseek/deepseek-v4.1-flash` без явно выбранного уровня при новой модели предлагается `low`; значение старого зафиксированного цикла не меняется. Запрос анализа передает мягкое предпочтение `provider.preferred_min_throughput.p90=100` для маршрутизации внутри выбранной модели. В `GET /cycles/{id}` значение `jobs[].result.diagnostics` доступно только для новых завершенных заданий.
 
 ## Выбор приемов и правила метода 2
 
@@ -109,7 +114,7 @@ Invoke-RestMethod -Uri "$base/api/v1/projects" -Method Post -ContentType 'applic
 
 | Метод и путь | Назначение |
 | --- | --- |
-| `GET /jobs/{id}` | `state`, фактический `stage`, `startedAt`, `lastProgressAt`, `progressChars`, `attemptCount`, ошибка и итоговые метаданные. Исходный input скрыт. |
+| `GET /jobs/{id}` | `state`, фактический `stage`, `startedAt`, `lastProgressAt`, `progressChars`, `attemptCount`, ошибка и итоговые метаданные. Исходный input скрыт. Новые завершенные задания могут содержать в `result.diagnostics` времена этапов, размер HTTP-запроса и доступное число reasoning tokens; старые записи этих полей не имеют. |
 | `PATCH /jobs/{id}/cancel` | Отменяет ожидающее задание или запрашивает остановку текущего. |
 | `GET /cycles/{id}/usage` | Сумма `inputTokens`, `outputTokens`, `totalTokens`, число попыток и флаг `complete`. При неполных данных соответствующая сумма равна `null`, а не нулю. |
 
@@ -128,6 +133,6 @@ Invoke-RestMethod -Uri "$base/api/v1/projects" -Method Post -ContentType 'applic
 }
 ```
 
-Частые коды: `INVALID_INPUT` (422), `CONTEXT_EXCEEDED` (422 с оценкой и лимитом), `STALE_ANALYSIS` (409), `CYCLE_LOCKED` (409), `RULE_SOURCES_EMPTY` (422), `SELECT_RULES_FIRST` (422), `KEY_MISSING` (422 или ошибка фонового задания), `KEY_INVALID`, `QUEUE_FULL` (429), `QUEUE_UNAVAILABLE` (503). Ошибки OpenRouter, неверный JSON и таймаут фонового задания отражаются в `AiJob.errorCode`; исходный текст остается сохраненным.
+Частые коды: `INVALID_INPUT` (422), `CONTEXT_EXCEEDED` (422 с оценкой и лимитом), `STALE_ANALYSIS` (409), `CYCLE_LOCKED` (409), `RULE_SOURCES_EMPTY` (422), `SELECT_RULES_FIRST` (422), `KEY_MISSING` (422 или ошибка фонового задания), `KEY_INVALID`, `MODEL_UNAVAILABLE` (HTTP 404 от OpenRouter), `MODEL_OR_REQUEST_INVALID` (HTTP 400), `QUEUE_FULL` (429), `QUEUE_UNAVAILABLE` (503). Ошибки OpenRouter, неверный JSON и тайм-аут фонового задания отражаются в `AiJob.errorCode`; исходный текст остается сохраненным.
 
 `GET /api/health/live` и `GET /api/health/ready` находятся **вне** префикса `/api/v1`. Первый показывает доступность веб-процесса; второй также проверяет БД и недавний heartbeat worker.
